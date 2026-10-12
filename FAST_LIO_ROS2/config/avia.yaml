@@ -35,7 +35,9 @@
                         0., 0., 1.]
 
         publish:
-            path_en:  false
+            path_en:  true              # true: publish path (/path)
+            effect_map_en: true         # true: publish Effects (/cloud_effected)
+            map_en: true                # true: publish Map cloud (/Laser_map)
             scan_publish_en:  true       # false: close all the point cloud output
             dense_publish_en: true       # false: low down the points number in a global-frame point clouds scan.
             scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame

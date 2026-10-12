@@ -16,11 +16,11 @@ def generate_launch_description():
     default_rviz_config_path = os.path.join(
         package_path, 'rviz', 'fastlio.rviz')
 
-    use_sim_time = LaunchConfiguration('use_sim_time')
-    config_path = LaunchConfiguration('config_path')
-    config_file = LaunchConfiguration('config_file')
-    rviz_use = LaunchConfiguration('rviz')
-    rviz_cfg = LaunchConfiguration('rviz_cfg')
+    use_sim_time_lc = LaunchConfiguration('use_sim_time')
+    config_path_lc = LaunchConfiguration('config_path')
+    config_file_lc = LaunchConfiguration('config_file')
+    rviz_use_lc = LaunchConfiguration('rviz')
+    rviz_cfg_lc = LaunchConfiguration('rviz_cfg')
 
     declare_use_sim_time_cmd = DeclareLaunchArgument(
         'use_sim_time', default_value='false',
@@ -46,15 +46,15 @@ def generate_launch_description():
     fast_lio_node = Node(
         package='fast_lio',
         executable='fastlio_mapping',
-        parameters=[PathJoinSubstitution([config_path, config_file]),
-                    {'use_sim_time': use_sim_time}],
+        parameters=[PathJoinSubstitution([config_path_lc, config_file_lc]),
+                    {'use_sim_time': use_sim_time_lc}],
         output='screen'
     )
     rviz_node = Node(
         package='rviz2',
         executable='rviz2',
-        arguments=['-d', rviz_cfg],
-        condition=IfCondition(rviz_use)
+        arguments=['-d', rviz_cfg_lc],
+        condition=IfCondition(rviz_use_lc)
     )
 
     ld = LaunchDescription()

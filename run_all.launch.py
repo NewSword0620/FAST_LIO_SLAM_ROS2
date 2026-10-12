@@ -29,7 +29,7 @@ def generate_launch_description():
         "loop", default_value="false", description="Play the bag in a loop"
     )
     declare_rviz = DeclareLaunchArgument(
-        "rviz", default_value="false", description="Launch RViz for front/back-end"
+        "rviz", default_value="true", description="Launch RViz for front/back-end"
     )
 
     bag_file = LaunchConfiguration("bag_file")

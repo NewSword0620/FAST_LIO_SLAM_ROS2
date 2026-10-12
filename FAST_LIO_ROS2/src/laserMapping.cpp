@@ -858,6 +858,8 @@ class LaserMappingNode : public rclcpp::Node {
     fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"), ios::out);
     fout_out.open(DEBUG_FILE_DIR("mat_out.txt"), ios::out);
     fout_dbg.open(DEBUG_FILE_DIR("dbg.txt"), ios::out);
+    fout_pc_stat.open(DEBUG_FILE_DIR("pc_stat.txt"), ios::out);
+    fout_kf.open(DEBUG_FILE_DIR("kf.txt"), ios::out);
     if (fout_pre && fout_out)
       cout << "~~~~" << ROOT_DIR << " file opened" << endl;
     else
@@ -914,6 +916,8 @@ class LaserMappingNode : public rclcpp::Node {
   ~LaserMappingNode() {
     fout_out.close();
     fout_pre.close();
+    fout_pc_stat.close();
+    fout_kf.close();
     fclose(fp);
   }
 
@@ -1092,6 +1096,30 @@ class LaserMappingNode : public rclcpp::Node {
       double solve_H_time = 0;
       kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
       state_point = kf.get_x();
+      // ---- 每帧点云统计日志 ----
+      {
+        double res_mean = effct_feat_num > 0 ? total_residual / effct_feat_num : 0.0;
+        fout_pc_stat << setw(16) << Measures.lidar_beg_time - first_lidar_time
+                     << " map:" << ikdtree.validnum()
+                     << " in:" << feats_undistort->points.size()
+                     << " down:" << feats_down_size
+                     << " valid:" << effct_feat_num
+                     << " res_mean:" << fixed << setprecision(5) << res_mean
+                     << " res_total:" << total_residual
+                     << " iter:" << iterCount << endl;
+      }
+      // ---- 卡尔曼滤波调试日志（预留）----
+      // 在 fout_kf 写入你需要的 KF 相关信息，可用量：
+      //   state_point.pos / vel / rot / bg / ba / grav（状态量）
+      //   kf.get_P()（协方差矩阵，需在 update 前保存）：
+      //     P 的 3x3 对角块: pos(0-2) vel(3-5) rot(6-8) bg(9-11) ba(12-14)
+      //   euler_cur（姿态欧拉角）、iterCount（迭代次数）
+      // 示例（按需取消注释）：
+      // fout_kf << setw(16) << Measures.lidar_beg_time - first_lidar_time
+      //         << " pos:" << state_point.pos.transpose()
+      //         << " vel:" << state_point.vel.transpose()
+      //         << " bg:" << state_point.bg.transpose()
+      //         << " ba:" << state_point.ba.transpose() << endl;
       euler_cur = SO3ToEuler(state_point.rot);
       pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
       geoQuat.x = state_point.rot.coeffs()[0];
@@ -1213,7 +1241,7 @@ class LaserMappingNode : public rclcpp::Node {
   double epsi[23] = {0.001};
 
   FILE *fp;
-  ofstream fout_pre, fout_out, fout_dbg;
+  ofstream fout_pre, fout_out, fout_dbg, fout_pc_stat, fout_kf;
 };
 
 int main(int argc, char **argv) {

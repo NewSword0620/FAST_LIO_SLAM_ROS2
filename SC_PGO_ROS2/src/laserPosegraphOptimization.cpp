@@ -159,47 +159,43 @@ gtsam::Pose3 Pose6DtoGTSAMPose3(const Pose6D &p) {
                       gtsam::Point3(p.x, p.y, p.z));
 }  // Pose6DtoGTSAMPose3
 
-void saveOdometryVerticesKITTIformat(std::string _filename) {
-  // ref from gtsam's original code "dataset.cpp"
+void saveOdometryVerticesTUMformat(std::string _filename) {
+  // TUM 格式：时间戳 tx ty tz qx qy qz qw（每行 8 列）
   std::fstream stream(_filename.c_str(), std::fstream::out);
-  for (const auto &_pose6d : keyframePoses) {
-    gtsam::Pose3 pose = Pose6DtoGTSAMPose3(_pose6d);
+  stream.precision(std::numeric_limits<double>::max_digits10);
+  for (size_t i = 0; i < keyframePoses.size(); ++i) {
+    gtsam::Pose3 pose = Pose6DtoGTSAMPose3(keyframePoses[i]);
     Point3 t = pose.translation();
-    Rot3 R = pose.rotation();
-    auto col1 = R.column(1);  // Point3
-    auto col2 = R.column(2);  // Point3
-    auto col3 = R.column(3);  // Point3
+    gtsam::Quaternion q = pose.rotation().toQuaternion();  // Eigen 四元数
+    double ts = (i < keyframeTimes.size()) ? keyframeTimes[i] : 0.0;
 
-    stream << col1.x() << " " << col2.x() << " " << col3.x() << " " << t.x()
-           << " " << col1.y() << " " << col2.y() << " " << col3.y() << " "
-           << t.y() << " " << col1.z() << " " << col2.z() << " " << col3.z()
-           << " " << t.z() << std::endl;
+    stream << ts << " " << t.x() << " " << t.y() << " " << t.z() << " "
+           << q.x() << " " << q.y() << " " << q.z() << " " << q.w()
+           << std::endl;
   }
 }
 
-void saveOptimizedVerticesKITTIformat(gtsam::Values _estimates,
+void saveOptimizedVerticesTUMformat(gtsam::Values _estimates,
                                       std::string _filename) {
   using namespace gtsam;
 
-  // ref from gtsam's original code "dataset.cpp"
+  // TUM 格式：时间戳 tx ty tz qx qy qz qw（每行 8 列）
   std::fstream stream(_filename.c_str(), std::fstream::out);
+  stream.precision(std::numeric_limits<double>::max_digits10);
 
   for (const auto &key_value : _estimates) {
     auto p = dynamic_cast<const GenericValue<Pose3> *>(&key_value.value);
     if (!p) continue;
 
     const Pose3 &pose = p->value();
-
+    gtsam::Key key = key_value.key;
     Point3 t = pose.translation();
-    Rot3 R = pose.rotation();
-    auto col1 = R.column(1);  // Point3
-    auto col2 = R.column(2);  // Point3
-    auto col3 = R.column(3);  // Point3
+    gtsam::Quaternion q = pose.rotation().toQuaternion();  // Eigen 四元数
+    double ts = (key < keyframeTimes.size()) ? keyframeTimes[key] : 0.0;
 
-    stream << col1.x() << " " << col2.x() << " " << col3.x() << " " << t.x()
-           << " " << col1.y() << " " << col2.y() << " " << col3.y() << " "
-           << t.y() << " " << col1.z() << " " << col2.z() << " " << col3.z()
-           << " " << t.z() << std::endl;
+    stream << ts << " " << t.x() << " " << t.y() << " " << t.z() << " "
+           << q.x() << " " << q.y() << " " << q.z() << " " << q.w()
+           << std::endl;
   }
 }
 
@@ -454,6 +450,7 @@ void loopFindNearKeyframesCloud(pcl::PointCloud<PointType>::Ptr &nearKeyframes,
     if (keyNear < 0 || keyNear >= int(keyframeLaserClouds.size())) continue;
 
     mKF.lock();
+    // TODO:作者都用的root_idx近似，高速移动的话会不会有问题？
     *nearKeyframes += *local2global(keyframeLaserClouds[keyNear],
                                     keyframePosesUpdated[root_idx]);
     mKF.unlock();
@@ -563,7 +560,7 @@ void removeNaNAndInfiniteInPlace(typename pcl::PointCloud<PointT>::Ptr &cloud) {
 }
 
 void process_pg() {
-  while (1) {
+  while (rclcpp::ok()) {
     // 有可配对的 odom + 点云数据时才处理（生产者-消费者）
     while (!odometryBuf.empty() && !fullResBuf.empty()) {
       mBuf.lock();
@@ -782,7 +779,7 @@ void process_lcd() {
 }
 
 void process_icp(void) {
-  while (1) {
+  while (rclcpp::ok()) {
     while (!scLoopICPBuf.empty()) {
       if (scLoopICPBuf.size() > 30) {
         RCLCPP_WARN(
@@ -841,8 +838,8 @@ void process_isam() {
       std::cout << "running isam2 optimization ..." << std::endl;
       mtxPosegraph.unlock();
 
-      saveOptimizedVerticesKITTIformat(isamCurrentEstimate, pgKITTIformat);
-      saveOdometryVerticesKITTIformat(odomKITTIformat);
+      saveOptimizedVerticesTUMformat(isamCurrentEstimate, pgKITTIformat);
+      saveOdometryVerticesTUMformat(odomKITTIformat);
     }
   }
 }
@@ -901,8 +898,9 @@ int main(int argc, char **argv) {
   nh->declare_parameter<double>("keyframe_deg_gap", 10.0);
   keyframeDegGap = nh->get_parameter("keyframe_deg_gap").as_double(); // 关键帧角度阈值(度)
 
-  // ---- 3. 准备输出文件（KITTI 格式结果）----
-  odomKITTIformat = save_directory + "odom_poses.txt";            // 优化后的位姿文件
+  // ---- 3. 准备输出文件（TUM 格式结果：时间 x y z qx qy qz qw）----
+  odomKITTIformat = save_directory + "odom_poses.txt";            // 原始里程计位姿文件（优化前）
+  pgKITTIformat = save_directory + "optimized_poses.txt";         // 优化后的位姿文件（PGO 后）
   pgTimeSaveStream =
       std::fstream(save_directory + "times.txt", std::fstream::out | std::fstream::trunc); // 每帧耗时文件
   pgTimeSaveStream.precision(std::numeric_limits<double>::max_digits10);

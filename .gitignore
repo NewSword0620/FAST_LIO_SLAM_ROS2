@@ -1,0 +1,22 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyc
+
+# ---- IDE / editor caches ----
+.vscode/browse.vc.db
+.vscode/browse.vc.db-shm
+.vscode/browse.vc.db-wal
+.vscode/browse.vc.db.lock
+.codegraph/*.db
+.codegraph/*.db-shm
+.codegraph/*.db-wal
+
+# ---- Build artifacts ----
+build/
+install/
+log/
+
+# ---- FAST-LIO runtime logs ----
+Log/
+*.pcd

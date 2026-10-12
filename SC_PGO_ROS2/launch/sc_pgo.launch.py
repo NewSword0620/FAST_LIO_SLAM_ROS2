@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import os
+
 from launch import LaunchDescription
 from launch_ros.actions import Node, PushRosNamespace
 from launch.actions import DeclareLaunchArgument, GroupAction
@@ -44,10 +46,14 @@ def generate_launch_description():
     )
 
     # RViz Node
+    rviz_config = os.path.join(
+        get_package_share_directory("sc_pgo_ros2"), "rviz_cfg", "aloam_velodyne.rviz"
+    )
     rviz_node = Node(
         package="rviz2",
         executable="rviz2",
         name="rvizscpgo",
+        arguments=["-d", rviz_config],
         remappings=[
             ("/tf", "tf"),
             ("/tf_static", "tf_static"),
