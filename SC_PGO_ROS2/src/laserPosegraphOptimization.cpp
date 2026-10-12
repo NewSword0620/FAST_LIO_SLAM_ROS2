@@ -176,7 +176,7 @@ void saveOdometryVerticesTUMformat(std::string _filename) {
 }
 
 void saveOptimizedVerticesTUMformat(gtsam::Values _estimates,
-                                      std::string _filename) {
+                                    std::string _filename) {
   using namespace gtsam;
 
   // TUM 格式：时间戳 tx ty tz qx qy qz qw（每行 8 列）
@@ -465,6 +465,52 @@ void loopFindNearKeyframesCloud(pcl::PointCloud<PointType>::Ptr &nearKeyframes,
   *nearKeyframes = *cloud_temp;
 }  // loopFindNearKeyframesCloud
 
+/**
+ * 提取key索引的关键帧前后相邻若干帧的关键帧特征点集合，降采样
+*/
+void loopFindNearKeyframes(pcl::PointCloud<PointType>::Ptr& nearKeyframes, const int& key, const int& searchNum)
+{
+    // 提取key索引的关键帧前后相邻若干帧的关键帧特征点集合
+    nearKeyframes->clear();
+    int cloudSize = keyframeLaserClouds.size();
+    for (int i = -searchNum; i <= searchNum; ++i)
+    {
+        int keyNear = key + i;
+        if (keyNear < 0 || keyNear >= cloudSize )
+            continue;
+        // *nearKeyframes += *transformPointCloud(keyframeLaserClouds[keyNear], &copy_cloudKeyPoses6D->points[keyNear]);
+        mKF.lock(); 
+        *nearKeyframes += * local2global(keyframeLaserClouds[keyNear], keyframePosesUpdated[keyNear]);
+        mKF.unlock();
+    }
+
+    if (nearKeyframes->empty())
+        return;
+
+    // 降采样
+    pcl::PointCloud<PointType>::Ptr cloud_temp(new pcl::PointCloud<PointType>());
+    downSizeFilterICP.setInputCloud(nearKeyframes);
+    downSizeFilterICP.filter(*cloud_temp);
+    *nearKeyframes = *cloud_temp;
+}
+
+/**
+ * Eigen格式的位姿变换
+*/
+Eigen::Affine3f Pose6dToAffine3f(Pose6D pose)
+{ 
+    return pcl::getTransformation(pose.x, pose.y, pose.z, pose.roll, pose.pitch, pose.yaw);
+}
+
+/**
+ * 位姿格式变换
+*/
+gtsam::Pose3 Pose6dTogtsamPose3(Pose6D pose)
+{
+    return gtsam::Pose3(gtsam::Rot3::RzRyRx(double(pose.roll), double(pose.pitch), double(pose.yaw)),
+                                gtsam::Point3(double(pose.x),    double(pose.y),     double(pose.z)));
+}
+
 std::optional<gtsam::Pose3> doICPVirtualRelative(int _loop_kf_idx,
                                                  int _curr_kf_idx) {
   // parse pointclouds
@@ -475,10 +521,9 @@ std::optional<gtsam::Pose3> doICPVirtualRelative(int _loop_kf_idx,
       new pcl::PointCloud<PointType>());
   pcl::PointCloud<PointType>::Ptr targetKeyframeCloud(
       new pcl::PointCloud<PointType>());
-  loopFindNearKeyframesCloud(cureKeyframeCloud, _curr_kf_idx, 0,
-                             _loop_kf_idx);  // use same root of loop kf idx
-  loopFindNearKeyframesCloud(targetKeyframeCloud, _loop_kf_idx,
-                             historyKeyframeSearchNum, _loop_kf_idx);
+  loopFindNearKeyframes(cureKeyframeCloud, _curr_kf_idx, 0); // Twc'*Pc(当前帧是没优化的，所以带')
+  loopFindNearKeyframes(targetKeyframeCloud, _loop_kf_idx, // Twt*Pt
+                             historyKeyframeSearchNum);
 
   // loop verification
   sensor_msgs::msg::PointCloud2 cureKeyframeCloudMsg;
@@ -525,15 +570,18 @@ std::optional<gtsam::Pose3> doICPVirtualRelative(int _loop_kf_idx,
   // Get pose transformation
   float x, y, z, roll, pitch, yaw;
   Eigen::Affine3f correctionLidarFrame;
-  correctionLidarFrame = icp.getFinalTransformation();
-  pcl::getTranslationAndEulerAngles(correctionLidarFrame, x, y, z, roll, pitch,
-                                    yaw);
-  gtsam::Pose3 poseFrom =
-      Pose3(Rot3::RzRyRx(roll, pitch, yaw), Point3(x, y, z));
-  gtsam::Pose3 poseTo =
-      Pose3(Rot3::RzRyRx(0.0, 0.0, 0.0), Point3(0.0, 0.0, 0.0));
+  correctionLidarFrame = icp.getFinalTransformation();// Ticp*Twc'*Ps=Twt*Pt, 即Ticp*Twc'=Twc
 
-  return poseFrom.between(poseTo);
+  Eigen::Affine3f tWrong = Pose6dToAffine3f(keyframePosesUpdated[_curr_kf_idx]);// Twc'
+
+  // 闭环优化后当前帧位姿
+  Eigen::Affine3f tCorrect = correctionLidarFrame * tWrong; // Ticp*Twc'=Twc
+  pcl::getTranslationAndEulerAngles(tCorrect, x, y, z, roll, pitch, yaw);
+  gtsam::Pose3 poseFrom = Pose3(Rot3::RzRyRx(roll, pitch, yaw), Point3(x, y, z));
+  // 闭环匹配帧的位姿
+  gtsam::Pose3 poseTo =  Pose6dTogtsamPose3(keyframePosesUpdated[_loop_kf_idx]);
+
+  return poseFrom.between(poseTo);// inv(Twc)*Twt, 即Tct
 }  // doICPVirtualRelative
 
 template <typename PointT>
@@ -802,7 +850,7 @@ void process_icp(void) {
         gtsam::Pose3 relative_pose = relative_pose_optional.value();
         mtxPosegraph.lock();
         gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(
-            prev_node_idx, curr_node_idx, relative_pose, robustLoopNoise));
+            curr_node_idx, prev_node_idx, relative_pose, robustLoopNoise));
         // runISAM2opt();
         mtxPosegraph.unlock();
       }
