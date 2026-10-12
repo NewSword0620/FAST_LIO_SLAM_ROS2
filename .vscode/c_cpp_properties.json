@@ -1,0 +1,22 @@
+{
+  "configurations": [
+    {
+      "browse": {
+        "databaseFilename": "${workspaceFolder}/.vscode/browse.vc.db",
+        "limitSymbolsToIncludedHeaders": false
+      },
+      "includePath": [
+        "/opt/ros/jazzy/include/**",
+        "/home/qst/Learn/fast_lio_slam_ros2/src/FAST_LIO_SLAM_ROS2/FAST_LIO_ROS2/include/**",
+        "/home/qst/Learn/fast_lio_slam_ros2/src/FAST_LIO_SLAM_ROS2/SC_PGO_ROS2/include/**",
+        "/usr/include/**"
+      ],
+      "name": "ros2",
+      "intelliSenseMode": "gcc-x64",
+      "compilerPath": "/usr/bin/gcc",
+      "cStandard": "gnu11",
+      "cppStandard": "c++17"
+    }
+  ],
+  "version": 4
+}
