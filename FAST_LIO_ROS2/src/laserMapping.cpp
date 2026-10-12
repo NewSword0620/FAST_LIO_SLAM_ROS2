@@ -32,6 +32,13 @@
 // CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
+
+// ============================================================================
+// FAST-LIO: 快速激光-惯性里程计 (Fast LiDAR-Inertial Odometry)
+// 核心流程: LiDAR/IMU数据回调 → 时间同步 → IMU去畸变 → 点-拟合平面匹配 → 迭代卡尔曼滤波 → 更新ikd-Tree地图
+// ============================================================================
+
+// ---------- 系统头文件 ----------
 #include <Python.h>
 #include <ikd-Tree/ikd_Tree.h>
 #include <math.h>
@@ -109,6 +116,12 @@ bool lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
 bool is_first_lidar = true;
 
+// ============================================================================
+// 核心数据结构（全局变量）
+// ============================================================================
+
+// ---- 数据缓冲区 ----
+
 vector<vector<int>> pointSearchInd_surf;
 vector<BoxPointType> cub_needrm;
 vector<PointVector> Nearest_Points;
@@ -151,8 +164,9 @@ geometry_msgs::msg::Quaternion geoQuat;
 geometry_msgs::msg::PoseStamped msg_body_pose;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
-shared_ptr<ImuProcess> p_imu(new ImuProcess());
+shared_ptr<ImuProcess> p_imu(new ImuProcess());  // IMU处理器（前向/反向传播、去畸变）
 
+// Ctrl+C 信号处理 → 优雅退出
 void SigHandle(int sig) {
   flg_exit = true;
   std::cout << "catch sig %d" << sig << std::endl;
@@ -298,8 +312,15 @@ void lasermap_fov_segment() {
   kdtree_delete_time = omp_get_wtime() - delete_begin;
 }
 
-double timediff_lidar_wrt_imu = 0.0;
-bool timediff_set_flg = false;
+double timediff_lidar_wrt_imu = 0.0;  // LiDAR/IMU时间差（用于时间同步）
+bool timediff_set_flg = false;        // 时间同步标志
+
+// ============================================================================
+// Livox 激光雷达回调函数（核心数据入口 #1）
+// 线程：ROS2 订阅回调线程
+// 作用：接收 Livox CustomMsg → 预处理（转PointCloud） → 存入 lidar_buffer
+// 注意：Livox 消息自带每个点的 timestamp，用于运动去畸变
+// ============================================================================
 void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg) {
   mtx_buffer.lock();
   double cur_time = get_time_sec(msg->header.stamp);
@@ -339,6 +360,11 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg) {
   sig_buffer.notify_all();
 }
 
+// ============================================================================
+// IMU 回调函数（核心数据入口 #2）
+// 线程：ROS2 订阅回调线程
+// 作用：接收 IMU 数据 → 时间补偿 → 存入 imu_buffer
+// ============================================================================
 void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in) {
   publish_count++;
   // cout<<"IMU got at: "<<msg_in->header.stamp.toSec()<<endl;
@@ -369,6 +395,10 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in) {
 
 double lidar_mean_scantime = 0.0;
 int scan_num = 0;
+// ============================================================================
+// 时间同步：从缓冲区取出一帧 LiDAR + 对应时间段内的所有 IMU 数据
+// 返回值：true=成功同步一帧, false=数据不足，等待更多数据
+// ============================================================================
 bool sync_packages(MeasureGroup &meas) {
   if (lidar_buffer.empty() || imu_buffer.empty()) {
     return false;
@@ -421,6 +451,10 @@ bool sync_packages(MeasureGroup &meas) {
 }
 
 int process_increments = 0;
+// ============================================================================
+// 地图增量更新：将当前帧的采样点（直接法，非特征提取）插入 ikd-Tree（地图数据结构）
+// 步骤：① 变换到世界坐标系 → ② 判断是否需要插入 → ③ ikdtree.Add_Points()
+// ============================================================================
 void map_incremental() {
   PointVector PointToAdd;
   PointVector PointNoNeedDownsample;
@@ -603,6 +637,11 @@ void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath) {
   }
 }
 
+// ============================================================================
+// ICP 匹配 + 残差计算（观测模型）
+// 对每个采样点（直接法）：变换到世界坐标 → ikdtree.Nearest_Search() 找最近5点 → 拟合平面 → 计算点到面的距离残差
+// 结果存入 ekfom_data，供卡尔曼滤波迭代更新使用
+// ============================================================================
 void h_share_model(state_ikfom &s,
                    esekfom::dyn_share_datastruct<double> &ekfom_data) {
   double match_start = omp_get_wtime();
@@ -719,51 +758,71 @@ void h_share_model(state_ikfom &s,
   solve_time += omp_get_wtime() - solve_start_;
 }
 
+// ============================================================================
+// ★ FAST-LIO 核心节点类
+// 继承 rclcpp::Node（ROS2 节点基类）
+// 构造函数：初始化所有参数、订阅/发布、定时器
+// timer_callback()：主循环，100Hz 执行一遍完整的 SLAM 流程
+// ============================================================================
 class LaserMappingNode : public rclcpp::Node {
  public:
   std::string lidar_frame_ =
       "body";  // temp: gets updated on first message received
 
+  // ========================================================================
+  // 构造函数 — 整个 FAST-LIO 节点的初始化入口
+  // 执行顺序：声明参数 → 读取参数 → 初始化滤波器 → 创建订阅/发布 → 启动定时器
+  // ========================================================================
   LaserMappingNode(const rclcpp::NodeOptions &options = rclcpp::NodeOptions())
       : Node("laser_mapping", options) {
-    this->declare_parameter<bool>("publish.path_en", true);
-    this->declare_parameter<bool>("publish.effect_map_en", false);
-    this->declare_parameter<bool>("publish.map_en", false);
-    this->declare_parameter<bool>("publish.scan_publish_en", true);
-    this->declare_parameter<bool>("publish.dense_publish_en", true);
-    this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
-    this->declare_parameter<int>("max_iteration", 4);
-    this->declare_parameter<string>("map_file_path", "");
-    this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
-    this->declare_parameter<string>("common.imu_topic", "/livox/imu");
-    this->declare_parameter<bool>("common.time_sync_en", false);
-    this->declare_parameter<double>("common.time_offset_lidar_to_imu", 0.0);
-    this->declare_parameter<double>("filter_size_corner", 0.5);
-    this->declare_parameter<double>("filter_size_surf", 0.5);
-    this->declare_parameter<double>("filter_size_map", 0.5);
-    this->declare_parameter<double>("cube_side_length", 200.);
-    this->declare_parameter<float>("mapping.det_range", 300.);
-    this->declare_parameter<double>("mapping.fov_degree", 180.);
-    this->declare_parameter<double>("mapping.gyr_cov", 0.1);
-    this->declare_parameter<double>("mapping.acc_cov", 0.1);
-    this->declare_parameter<double>("mapping.b_gyr_cov", 0.0001);
-    this->declare_parameter<double>("mapping.b_acc_cov", 0.0001);
-    this->declare_parameter<double>("preprocess.blind", 0.01);
-    this->declare_parameter<int>("preprocess.lidar_type", AVIA);
-    this->declare_parameter<int>("preprocess.scan_line", 16);
-    this->declare_parameter<int>("preprocess.timestamp_unit", US);
-    this->declare_parameter<int>("preprocess.scan_rate", 10);
-    this->declare_parameter<int>("point_filter_num", 2);
-    this->declare_parameter<bool>("feature_extract_enable", false);
-    this->declare_parameter<bool>("runtime_pos_log_enable", false);
-    this->declare_parameter<bool>("mapping.extrinsic_est_en", true);
-    this->declare_parameter<bool>("pcd_save.pcd_save_en", false);
-    this->declare_parameter<int>("pcd_save.interval", -1);
-    this->declare_parameter<vector<double>>("mapping.extrinsic_T",
-                                            vector<double>());
-    this->declare_parameter<vector<double>>("mapping.extrinsic_R",
-                                            vector<double>());
+    // ================================================================
+    // 第1步：声明所有可配置参数（参数名、类型、默认值）
+    // 这些参数可以通过 YAML 配置文件或命令行传入
+    // ================================================================
 
+    // --- 发布开关 ---
+    this->declare_parameter<bool>("publish.path_en", true);              // 是否发布轨迹路径
+    this->declare_parameter<bool>("publish.effect_map_en", false);       // 是否发布有效匹配点云（参与优化用的）
+    this->declare_parameter<bool>("publish.map_en", false);              // 是否发布全局地图
+    this->declare_parameter<bool>("publish.scan_publish_en", true);      // 是否发布当前帧点云
+    this->declare_parameter<bool>("publish.dense_publish_en", true);     // true=稠密点云, false=降采样后
+    this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true); // 是否发布机体坐标系点云
+    this->declare_parameter<int>("max_iteration", 4);                    // 卡尔曼滤波最大迭代次数
+    this->declare_parameter<string>("map_file_path", "");                // 地图保存路径
+    this->declare_parameter<string>("common.lid_topic", "/livox/lidar"); // 订阅的LiDAR话题名
+    this->declare_parameter<string>("common.imu_topic", "/livox/imu");   // 订阅的IMU话题名
+    this->declare_parameter<bool>("common.time_sync_en", false);         // 是否启用时间自同步
+    this->declare_parameter<double>("common.time_offset_lidar_to_imu", 0.0); // LiDAR→IMU时间偏移
+    this->declare_parameter<double>("filter_size_corner", 0.5);          // 角点体素降采样尺寸(m)
+    this->declare_parameter<double>("filter_size_surf", 0.5);            // 面点体素降采样尺寸(m)
+    this->declare_parameter<double>("filter_size_map", 0.5);             // 地图体素降采样尺寸(m)
+    this->declare_parameter<double>("cube_side_length", 200.);           // 局部地图立方体边长(m)
+    this->declare_parameter<float>("mapping.det_range", 300.);           // LiDAR最大探测距离(m)
+    this->declare_parameter<double>("mapping.fov_degree", 180.);         // LiDAR视场角(度)
+    this->declare_parameter<double>("mapping.gyr_cov", 0.1);             // 陀螺仪噪声协方差
+    this->declare_parameter<double>("mapping.acc_cov", 0.1);             // 加速度计噪声协方差
+    this->declare_parameter<double>("mapping.b_gyr_cov", 0.0001);        // 陀螺仪偏置噪声协方差
+    this->declare_parameter<double>("mapping.b_acc_cov", 0.0001);        // 加速度计偏置噪声协方差
+    this->declare_parameter<double>("preprocess.blind", 0.01);           // LiDAR盲区距离(m)
+    this->declare_parameter<int>("preprocess.lidar_type", AVIA);         // 雷达类型：1=Livox, 2=Velodyne, 3=Ouster
+    this->declare_parameter<int>("preprocess.scan_line", 16);            // 扫描线数
+    this->declare_parameter<int>("preprocess.timestamp_unit", US);       // 时间戳单位
+    this->declare_parameter<int>("preprocess.scan_rate", 10);            // 扫描频率(Hz)
+    this->declare_parameter<int>("point_filter_num", 2);                 // 点过滤数量
+    this->declare_parameter<bool>("feature_extract_enable", false);      // 是否启用特征提取
+    this->declare_parameter<bool>("runtime_pos_log_enable", false);      // 是否运行时记录位置日志
+    this->declare_parameter<bool>("mapping.extrinsic_est_en", true);     // 是否在线估计外参
+    this->declare_parameter<bool>("pcd_save.pcd_save_en", false);        // 是否保存PCD地图
+    this->declare_parameter<int>("pcd_save.interval", -1);               // PCD保存间隔(-1=结束时保存)
+    this->declare_parameter<vector<double>>("mapping.extrinsic_T",
+                                            vector<double>()); // LiDAR→IMU平移外参
+    this->declare_parameter<vector<double>>("mapping.extrinsic_R",
+                                            vector<double>()); // LiDAR→IMU旋转外参
+
+    // ================================================================
+    // 第2步：读取参数到全局变量（参数名, 目标变量, 默认值）
+    // declare 只是声明"有这些参数"，get 才是真正把值读出来
+    // ================================================================
     this->get_parameter_or<bool>("publish.path_en", path_en, true);
     this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
     this->get_parameter_or<bool>("publish.map_en", map_pub_en, false);
@@ -812,24 +871,31 @@ class LaserMappingNode : public rclcpp::Node {
     this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR,
                                            vector<double>());
 
-    RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
+    RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);  // 打印雷达类型
 
+    // 初始化路径消息头（坐标系 = camera_init）
     path.header.stamp = this->get_clock()->now();
     path.header.frame_id = "camera_init";
 
+    // ================================================================
+    // 第3步：初始化算法参数
+    // ================================================================
     // /*** variables definition ***/
     // int effect_feat_num = 0, frame_num = 0;
     // double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0,
     // aver_time_match = 0, aver_time_incre = 0, aver_time_solve = 0,
     // aver_time_const_H_time = 0; bool flg_EKF_converged, EKF_stop_flg = 0;
 
+    // 计算 LiDAR 视场角（略微扩大 10 度）
     FOV_DEG = (fov_deg + 10.0) > 179.9 ? 179.9 : (fov_deg + 10.0);
-    HALF_FOV_COS = cos((FOV_DEG) * 0.5 * PI_M / 180.0);
+    HALF_FOV_COS = cos((FOV_DEG) * 0.5 * PI_M / 180.0);  // 半视场角余弦值（用于判断点是否在视野内）
 
     _featsArray.reset(new PointCloudXYZI());
 
-    memset(point_selected_surf, true, sizeof(point_selected_surf));
-    memset(res_last, -1000.0f, sizeof(res_last));
+    // 初始化标记数组
+    memset(point_selected_surf, true, sizeof(point_selected_surf));  // 默认所有点有效
+    memset(res_last, -1000.0f, sizeof(res_last));  // 上一帧残差初始化为-1000
+    // 设置体素降采样滤波器尺寸
     downSizeFilterSurf.setLeafSize(filter_size_surf_min, filter_size_surf_min,
                                    filter_size_surf_min);
     downSizeFilterMap.setLeafSize(filter_size_map_min, filter_size_map_min,
@@ -837,27 +903,31 @@ class LaserMappingNode : public rclcpp::Node {
     memset(point_selected_surf, true, sizeof(point_selected_surf));
     memset(res_last, -1000.0f, sizeof(res_last));
 
-    Lidar_T_wrt_IMU << VEC_FROM_ARRAY(extrinT);
-    Lidar_R_wrt_IMU << MAT_FROM_ARRAY(extrinR);
+    // 配置 IMU 处理器参数：外参 + 噪声协方差
+    Lidar_T_wrt_IMU << VEC_FROM_ARRAY(extrinT);  // LiDAR到IMU的平移
+    Lidar_R_wrt_IMU << MAT_FROM_ARRAY(extrinR);  // LiDAR到IMU的旋转
     p_imu->set_extrinsic(Lidar_T_wrt_IMU, Lidar_R_wrt_IMU);
-    p_imu->set_gyr_cov(V3D(gyr_cov, gyr_cov, gyr_cov));
-    p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
-    p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
-    p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
+    p_imu->set_gyr_cov(V3D(gyr_cov, gyr_cov, gyr_cov));  // 陀螺仪噪声
+    p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));  // 加速度计噪声
+    p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));  // 陀螺仪偏置噪声
+    p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));  // 加速度计偏置噪声
 
-    fill(epsi, epsi + 23, 0.001);
+    // 初始化迭代卡尔曼滤波器（IKFoM）
+    // 绑定系统模型：get_f(状态转移), df_dx(状态雅可比), df_dw(噪声雅可比), h_share_model(观测模型)
+    fill(epsi, epsi + 23, 0.001);  // 收敛阈值设为 0.001
     kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS,
                       epsi);
 
     /*** debug record ***/
     // FILE *fp;
+    // 打开调试日志文件
     string pos_log_dir = root_dir + "/Log/pos_log.txt";
-    fp = fopen(pos_log_dir.c_str(), "w");
+    fp = fopen(pos_log_dir.c_str(), "w");  // 位置日志
 
     // ofstream fout_pre, fout_out, fout_dbg;
-    fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"), ios::out);
-    fout_out.open(DEBUG_FILE_DIR("mat_out.txt"), ios::out);
-    fout_dbg.open(DEBUG_FILE_DIR("dbg.txt"), ios::out);
+    fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"), ios::out);  // 优化前状态
+    fout_out.open(DEBUG_FILE_DIR("mat_out.txt"), ios::out);  // 优化后状态
+    fout_dbg.open(DEBUG_FILE_DIR("dbg.txt"), ios::out);      // 调试信息
     fout_pc_stat.open(DEBUG_FILE_DIR("pc_stat.txt"), ios::out);
     fout_kf.open(DEBUG_FILE_DIR("kf.txt"), ios::out);
     if (fout_pre && fout_out)
@@ -865,50 +935,63 @@ class LaserMappingNode : public rclcpp::Node {
     else
       cout << "~~~~" << ROOT_DIR << " doesn't exist" << endl;
 
+    // ================================================================
+    // 第4步：创建 ROS2 订阅（输入数据通道）
+    // ================================================================
     /*** ROS subscribe initialization ***/
     if (p_pre->lidar_type == AVIA) {
+      // Livox 雷达：订阅自定义消息（含每个点的时间戳）
       sub_pcl_livox_ =
           this->create_subscription<livox_ros_driver2::msg::CustomMsg>(
               lid_topic, 20, livox_pcl_cbk);
     } else {
+      // 其他雷达：订阅标准 PointCloud2 消息
       sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
           lid_topic, rclcpp::SensorDataQoS(),
           std::bind(&LaserMappingNode::standard_pcl_cbk, this,
                     std::placeholders::_1));
     }
     sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(
-        imu_topic, rclcpp::SensorDataQoS(), imu_cbk);
+        imu_topic, rclcpp::SensorDataQoS(), imu_cbk);  // IMU订阅
+    // ================================================================
+    // 第5步：创建 ROS2 发布器（输出数据通道 → RViz2 显示）
+    // ================================================================
     pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-        "/cloud_registered", 20);
+        "/cloud_registered", 20);  // 全局点云（用于RViz显示）
     pubLaserCloudFull_body_ =
         this->create_publisher<sensor_msgs::msg::PointCloud2>(
-            "/cloud_registered_body", 20);
+            "/cloud_registered_body", 20);  // 机体坐标点云
     pubLaserCloudEffect_ =
         this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected",
-                                                              20);
+                                                              20);  // 有效匹配点云（参与残差计算的点）
     pubLaserCloudMap_ =
-        this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
+        this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);  // 全局地图
     pubOdomAftMapped_ =
-        this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
-    pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
-    tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+        this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);  // 里程计（位姿+协方差）
+    pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);  // 轨迹路径
+    tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);  // TF广播器（camera_init→body）
 
-    //------------------------------------------------------------------------------------------------------
+    // ================================================================
+    // 第6步：创建定时器 + 服务
+    // ================================================================
     auto period_ms =
         std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 100.0));
     timer_ = rclcpp::create_timer(
         this, this->get_clock(), period_ms,
         std::bind(&LaserMappingNode::timer_callback, this));
+    // ↑ 主循环定时器 100Hz（每 10ms 执行一次 timer_callback）
 
     auto map_period_ms =
         std::chrono::milliseconds(static_cast<int64_t>(1000.0));
     map_pub_timer_ = rclcpp::create_timer(
         this, this->get_clock(), map_period_ms,
         std::bind(&LaserMappingNode::map_publish_callback, this));
+    // ↑ 地图发布定时器 1Hz（每秒发布一次全局地图）
 
     map_save_srv_ = this->create_service<std_srvs::srv::Trigger>(
         "map_save", std::bind(&LaserMappingNode::map_save_callback, this,
                               std::placeholders::_1, std::placeholders::_2));
+    // ↑ 地图保存服务（运行 ros2 service call /map_save 时触发）
 
     RCLCPP_INFO(this->get_logger(), "Node init finished.");
   }
@@ -922,6 +1005,11 @@ class LaserMappingNode : public rclcpp::Node {
   }
 
  private:
+  // ==========================================================================
+  // 标准点云回调（Velodyne/Ouster 等非Livox雷达）
+  // 线程：ROS2 订阅回调线程
+  // 作用：接收点云 → 预处理 → 存入 lidar_buffer（生产者）
+  // ==========================================================================
   void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) {
     mtx_buffer.lock();
     scan_count++;
@@ -999,7 +1087,11 @@ class LaserMappingNode : public rclcpp::Node {
     publish_count -= PUBFRAME_PERIOD;
   }
 
+  // ★ 主循环入口（100Hz 定时器触发）
+  // 每次被调用时执行一条完整的 SLAM 流水线：
+  // sync_packages → IMU去畸变 → 降采样 → 点-拟合平面匹配(h_share_model) → 卡尔曼滤波 → 发布里程计 → 更新地图
   void timer_callback() {
+    // 步骤1：尝试从缓冲区同步一帧数据（LiDAR + IMU）
     if (sync_packages(Measures)) {
       if (flg_first_scan) {
         first_lidar_time = Measures.lidar_beg_time;
@@ -1017,6 +1109,7 @@ class LaserMappingNode : public rclcpp::Node {
       svd_time = 0;
       t0 = omp_get_wtime();
 
+      // 步骤2：IMU前向+反向传播 → 运动去畸变 → 得到 feats_undistort
       p_imu->Process(Measures, kf, feats_undistort);
       state_point = kf.get_x();
       pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
@@ -1033,6 +1126,7 @@ class LaserMappingNode : public rclcpp::Node {
       lasermap_fov_segment();
 
       /*** downsample the feature points in a scan ***/
+      // 步骤3：体素降采样（减少计算量）
       downSizeFilterSurf.setInputCloud(feats_undistort);
       downSizeFilterSurf.filter(*feats_down_body);
       t1 = omp_get_wtime();
@@ -1091,9 +1185,10 @@ class LaserMappingNode : public rclcpp::Node {
 
       t2 = omp_get_wtime();
 
-      /*** iterated state estimation ***/
+      /*** 步骤4：迭代卡尔曼滤波 —— 点-拟合平面匹配 + 状态估计 ***/
       double t_update_start = omp_get_wtime();
       double solve_H_time = 0;
+      // 内部会调用 h_share_model() 计算残差 → 迭代更新状态
       kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
       state_point = kf.get_x();
       // ---- 每帧点云统计日志 ----
@@ -1130,14 +1225,17 @@ class LaserMappingNode : public rclcpp::Node {
       double t_update_end = omp_get_wtime();
 
       /******* Publish odometry *******/
+      // 步骤5：发布里程计（位姿 + 协方差 + TF 变换）
       publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
 
       /*** add the feature points to map kdtree ***/
+      // 步骤6：将当前帧特征点增量插入地图 KD-Tree（同时按 FOV 删除远处点）
       t3 = omp_get_wtime();
       map_incremental();
       t5 = omp_get_wtime();
 
       /******* Publish points *******/
+      // 步骤7：发布路径 / 世界系点云 / 体系点云 / 有效匹配点云（可视化）
       if (path_en) publish_path(pubPath_);
       if (scan_pub_en) publish_frame_world(pubLaserCloudFull_);
       if (scan_pub_en && scan_body_pub_en)
@@ -1146,6 +1244,7 @@ class LaserMappingNode : public rclcpp::Node {
       // if (map_pub_en) publish_map(pubLaserCloudMap_);
 
       /*** Debug variables ***/
+      // 步骤8：统计与打印各阶段耗时（仅当 runtime_pos_log 开启时）
       if (runtime_pos_log) {
         frame_num++;
         kdtree_size_end = ikdtree.size();

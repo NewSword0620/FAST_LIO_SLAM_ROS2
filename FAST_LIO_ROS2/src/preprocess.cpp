@@ -275,29 +275,35 @@ void Preprocess::oust64_handler(
   // pub_func(pl_surf, pub_corn, msg->header.stamp);
 }
 
+// ===== Velodyne 旋转雷达预处理 =====
 void Preprocess::velodyne_handler(
     const sensor_msgs::msg::PointCloud2::UniquePtr& msg) {
+  // 清空上一帧数据
   pl_surf.clear();
   pl_corn.clear();
   pl_full.clear();
 
+  // 将 ROS2 PointCloud2 转为 Velodyne 专用点类型（含 ring, time 字段）
   pcl::PointCloud<velodyne_ros::Point> pl_orig;
   pcl::fromROSMsg(*msg, pl_orig);
-  int plsize = pl_orig.points.size();
+  int plsize = pl_orig.points.size();  // 一帧总点数（如 16线×3000≈4.8万）
   if (plsize == 0) return;
-  pl_surf.reserve(plsize);
+  pl_surf.reserve(plsize);  // 预分配内存
 
   /*** These variables only works when no point timestamps given ***/
-  double omega_l = 0.361 * SCAN_RATE;  // scan angular velocity
-  std::vector<bool> is_first(N_SCANS, true);
-  std::vector<double> yaw_fp(N_SCANS, 0.0);    // yaw of first scan point
-  std::vector<float> yaw_last(N_SCANS, 0.0);   // yaw of last scan point
-  std::vector<float> time_last(N_SCANS, 0.0);  // last offset time
+  // 以下是硬件没给时间戳时，用角度推算时间所需的变量
+  double omega_l = 0.361 * SCAN_RATE;         // scan angular velocity  (°/ms)
+  std::vector<bool> is_first(N_SCANS, true);  // 每条线第一个点的标记
+  std::vector<double> yaw_fp(N_SCANS, 0.0);   // 每条线的起始方位角 (yaw of first scan point)
+  std::vector<float> yaw_last(N_SCANS, 0.0);  // 每条线上一个点的方位角 (yaw of last scan point)
+  std::vector<float> time_last(N_SCANS, 0.0); // 每条线上一个点的时间偏移 (last offset time)
   /*****************************************************************/
 
+  // 判断硬件是否提供了点的时间戳：最后一个点 time > 0 即有
   if (pl_orig.points[plsize - 1].time > 0) {
     given_offset_time = true;
   } else {
+    // 无时间戳：计算起始线和结束时同一线的 yaw 跨度（用于后面推算角速度校验）
     given_offset_time = false;
     double yaw_first =
         atan2(pl_orig.points[0].y, pl_orig.points[0].x) * 57.29578;
@@ -311,18 +317,21 @@ void Preprocess::velodyne_handler(
     }
   }
 
+  // ===== 分支 A：提取特征（LOAM 风格角点+面点） =====
   if (feature_enabled) {
+    // 初始化每条线的缓冲区
     for (int i = 0; i < N_SCANS; i++) {
       pl_buff[i].clear();
       pl_buff[i].reserve(plsize);
     }
 
+    // 遍历所有点，按线号（ring）分别存储
     for (int i = 0; i < plsize; i++) {
       PointType added_pt;
       added_pt.normal_x = 0;
       added_pt.normal_y = 0;
       added_pt.normal_z = 0;
-      int layer = pl_orig.points[i].ring;
+      int layer = pl_orig.points[i].ring;  // 线号（0~15 或 0~63）
       if (layer >= N_SCANS) continue;
       added_pt.x = pl_orig.points[i].x;
       added_pt.y = pl_orig.points[i].y;
@@ -331,9 +340,11 @@ void Preprocess::velodyne_handler(
       added_pt.curvature =
           pl_orig.points[i].time * time_unit_scale;  // units: ms
 
+      // 无硬件时间戳时：用角度÷角速度推算
       if (!given_offset_time) {
         double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
         if (is_first[layer]) {
+          // 该线第一个点：记下起始角度，curvature 设为 0
           // printf("layer: %d; is first: %d", layer, is_first[layer]);
           yaw_fp[layer] = yaw_angle;
           is_first[layer] = false;
@@ -343,12 +354,15 @@ void Preprocess::velodyne_handler(
           continue;
         }
 
+        // (起始角 - 当前角) ÷ 角速度 = 时间偏移
         if (yaw_angle <= yaw_fp[layer]) {
           added_pt.curvature = (yaw_fp[layer] - yaw_angle) / omega_l;
         } else {
+          // 跨 0° 边界时 +360° 补偿
           added_pt.curvature = (yaw_fp[layer] - yaw_angle + 360.0) / omega_l;
         }
 
+        // 防止同一线相邻点时间倒流（轻微 yaw 抖动导致）
         if (added_pt.curvature < time_last[layer])
           added_pt.curvature += 360.0 / omega_l;
 
@@ -359,6 +373,7 @@ void Preprocess::velodyne_handler(
       pl_buff[layer].points.push_back(added_pt);
     }
 
+    // 每条线单独提特征
     for (int j = 0; j < N_SCANS; j++) {
       PointCloudXYZI& pl = pl_buff[j];
       int linesize = pl.size();
@@ -368,17 +383,20 @@ void Preprocess::velodyne_handler(
       types.resize(linesize);
       linesize--;
       for (uint i = 0; i < linesize; i++) {
-        types[i].range = sqrt(pl[i].x * pl[i].x + pl[i].y * pl[i].y);
+        types[i].range =
+            sqrt(pl[i].x * pl[i].x + pl[i].y * pl[i].y);  // 水平距离
         vx = pl[i].x - pl[i + 1].x;
         vy = pl[i].y - pl[i + 1].y;
         vz = pl[i].z - pl[i + 1].z;
-        types[i].dista = vx * vx + vy * vy + vz * vz;
+        types[i].dista = vx * vx + vy * vy + vz * vz;  // 相邻点间距
       }
       types[linesize].range = sqrt(pl[linesize].x * pl[linesize].x +
                                    pl[linesize].y * pl[linesize].y);
-      give_feature(pl, types);
+      give_feature(pl, types);  // 判别角点、面点
     }
-  } else {
+  }
+  // ===== 分支 B：不提取特征（FAST-LIO2 直接法） =====
+  else {
     for (int i = 0; i < plsize; i++) {
       PointType added_pt;
       // cout<<"!!!!!!"<<i<<" "<<plsize<<endl;
@@ -394,6 +412,7 @@ void Preprocess::velodyne_handler(
                            time_unit_scale;  // curvature unit: ms //
                                              // cout<<added_pt.curvature<<endl;
 
+      // 无硬件时间戳时：用角度推算（同上）
       if (!given_offset_time) {
         int layer = pl_orig.points[i].ring;
         double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
@@ -422,10 +441,11 @@ void Preprocess::velodyne_handler(
         time_last[layer] = added_pt.curvature;
       }
 
-      if (i % point_filter_num == 0) {
+      // 降采样 + 盲区过滤
+      if (i % point_filter_num == 0) {  // 每 point_filter_num 个采 1 个
         if (added_pt.x * added_pt.x + added_pt.y * added_pt.y +
                 added_pt.z * added_pt.z >
-            (blind * blind)) {
+            (blind * blind)) {  // 跳过盲区
           pl_surf.points.push_back(added_pt);
         }
       }
